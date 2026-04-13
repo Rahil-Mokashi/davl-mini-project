@@ -1,0 +1,1117 @@
+import { lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from 'react'
+import type { Config, Data, Layout } from 'plotly.js'
+
+const Plot = lazy(() => import('react-plotly.js'))
+import WorldMap from './components/WorldMap'
+import LiveQueue from './components/LiveQueue'
+import {
+  BarElement,
+  CategoryScale,
+  Chart as ChartJS,
+  LinearScale,
+  Tooltip as ChartTooltip,
+} from 'chart.js'
+import type { ChartData, ChartOptions } from 'chart.js'
+import { Bar as ChartJsBar } from 'react-chartjs-2'
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  Legend,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts'
+
+ChartJS.register(CategoryScale, LinearScale, BarElement, ChartTooltip)
+
+const ATTACK_TYPE_OPTIONS = [
+  'all',
+  'Phishing',
+  'Ransomware',
+  'DDoS',
+  'Credential stuffing',
+  'Malware',
+] as const
+
+type AttackTypeOption = (typeof ATTACK_TYPE_OPTIONS)[number]
+
+const ATTACK_TYPE_LABELS = ATTACK_TYPE_OPTIONS.filter(
+  (o): o is Exclude<AttackTypeOption, 'all'> => o !== 'all',
+)
+
+/** Stable colors per attack type (pie + legend alignment) */
+const ATTACK_TYPE_PIE_COLORS: Record<(typeof ATTACK_TYPE_LABELS)[number], string> = {
+  Phishing: '#06b6d4',
+  Ransomware: '#8b5cf6',
+  DDoS: '#f59e0b',
+  'Credential stuffing': '#6366f1',
+  Malware: '#f43f5e',
+}
+
+/** One bin per integer severity (1–10), aligned with dashboard severity controls */
+const SEVERITY_BIN_LABELS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'] as const
+
+const SEVERITY_HISTOGRAM_FILLS: string[] = [
+  '#5eead4',
+  '#2dd4bf',
+  '#fcd34d',
+  '#fbbf24',
+  '#fb923c',
+  '#f97316',
+  '#f87171',
+  '#ef4444',
+  '#fb7185',
+  '#e11d48',
+]
+
+type MockEvent = {
+  id: string
+  attackType: Exclude<AttackTypeOption, 'all'>
+  at: number
+  severity: number
+  /** Incident dwell / time-to-contain (minutes), synthetic */
+  durationMinutes: number
+  /** Synthetic exfiltration estimate (GB) */
+  dataLossGb: number
+  /** Synthetic financial impact (thousands USD) */
+  costKUsd: number
+  /** ISO3 country code for choropleth */
+  countryIso3: string
+  /** Country name */
+  country?: string
+}
+
+type BoxFenceStats = { q1: number; q3: number; iqr: number; lower: number; upper: number }
+
+function quantileSorted(sorted: number[], q: number): number {
+  const n = sorted.length
+  if (n === 0) return 0
+  const pos = (n - 1) * q
+  const lo = Math.floor(pos)
+  const hi = Math.ceil(pos)
+  if (lo === hi) return sorted[lo]!
+  return sorted[lo]! + (pos - lo) * (sorted[hi]! - sorted[lo]!)
+}
+
+function boxFenceStats(sorted: number[]): BoxFenceStats | null {
+  if (sorted.length === 0) return null
+  const q1 = quantileSorted(sorted, 0.25)
+  const q3 = quantileSorted(sorted, 0.75)
+  const iqr = q3 - q1
+  const lower = q1 - 1.5 * iqr
+  const upper = q3 + 1.5 * iqr
+  return { q1, q3, iqr, lower, upper }
+}
+
+function isFenceOutlier(value: number, stats: BoxFenceStats): boolean {
+  if (stats.iqr <= 0) return false
+  return value < stats.lower || value > stats.upper
+}
+
+function boxPointHoverHtml(value: number, stats: BoxFenceStats, kind: 'severity' | 'duration'): string {
+  const fmt = (n: number) => (kind === 'duration' ? `${Math.round(n)} min` : String(Math.round(n * 10) / 10))
+  const out = isFenceOutlier(value, stats)
+  const fence = `Q1 ${fmt(stats.q1)}, Q3 ${fmt(stats.q3)}, IQR ${fmt(stats.iqr)} · fences ${fmt(stats.lower)}–${fmt(stats.upper)}`
+  if (!out) {
+    return `${fence}<br><span style="color:#4ade80">Inside 1.5×IQR whiskers — not flagged.</span>`
+  }
+  const dir = value < stats.lower ? 'below the lower fence' : 'above the upper fence'
+  return `${fence}<br><b style="color:#fb7185">Outlier</b> (${dir}): outside Q1−1.5×IQR or Q3+1.5×IQR — often rare tail events, long-running incidents, or data you should triage.`
+}
+
+function parseISODateLocal(s: string): number {
+  const [y, m, d] = s.split('-').map(Number)
+  return new Date(y, m - 1, d).getTime()
+}
+
+function endOfDayLocal(iso: string): number {
+  return parseISODateLocal(iso) + 86400000 - 1
+}
+
+function formatLocalISODate(d: Date): string {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+function formatCompact(n: number): string {
+  return n.toLocaleString(undefined, { maximumFractionDigits: 0 })
+}
+
+function mean(nums: number[]): number {
+  if (nums.length === 0) return 0
+  return nums.reduce((s, x) => s + x, 0) / nums.length
+}
+
+function pearsonCorrelation(a: number[], b: number[]): number {
+  const n = a.length
+  if (n < 2 || b.length !== n) return 0
+  const ma = mean(a)
+  const mb = mean(b)
+  let cov = 0
+  let va = 0
+  let vb = 0
+  for (let i = 0; i < n; i++) {
+    const da = a[i]! - ma
+    const db = b[i]! - mb
+    cov += da * db
+    va += da * da
+    vb += db * db
+  }
+  const den = Math.sqrt(va * vb)
+  return den === 0 ? 0 : cov / den
+}
+
+function correlationMatrix(cols: number[][]): number[][] {
+  const k = cols.length
+  return Array.from({ length: k }, (_, i) =>
+    Array.from({ length: k }, (_, j) => pearsonCorrelation(cols[i]!, cols[j]!)),
+  )
+}
+
+/** Axis / matrix labels for correlation heatmap */
+const CORRELATION_METRIC_LABELS = [
+  'Severity',
+  'Duration (min)',
+  'Data loss (GB)',
+  'Cost ($k)',
+] as const
+
+function generateMockEvents(): MockEvent[] {
+  const COUNTRIES = [
+    { iso3: 'USA', country: 'United States' },
+    { iso3: 'CAN', country: 'Canada' },
+    { iso3: 'MEX', country: 'Mexico' },
+    { iso3: 'BRA', country: 'Brazil' },
+    { iso3: 'ARG', country: 'Argentina' },
+    { iso3: 'GBR', country: 'United Kingdom' },
+    { iso3: 'FRA', country: 'France' },
+    { iso3: 'DEU', country: 'Germany' },
+    { iso3: 'RUS', country: 'Russia' },
+    { iso3: 'CHN', country: 'China' },
+    { iso3: 'IND', country: 'India' },
+    { iso3: 'PAK', country: 'Pakistan' },
+    { iso3: 'JPN', country: 'Japan' },
+    { iso3: 'KOR', country: 'South Korea' },
+    { iso3: 'AUS', country: 'Australia' },
+    { iso3: 'IDN', country: 'Indonesia' },
+    { iso3: 'ZAF', country: 'South Africa' },
+    { iso3: 'NGA', country: 'Nigeria' },
+    { iso3: 'EGY', country: 'Egypt' },
+    { iso3: 'TUR', country: 'Turkey' },
+    { iso3: 'SAU', country: 'Saudi Arabia' },
+  ]
+  const types: MockEvent['attackType'][] = [
+    'Phishing',
+    'Ransomware',
+    'DDoS',
+    'Credential stuffing',
+    'Malware',
+  ]
+  const now = Date.now()
+  const day = 86400000
+  const events: MockEvent[] = []
+  for (let i = 0; i < 1400; i++) {
+    const at = now - Math.floor(Math.random() * 88 * day)
+    let durationMinutes = Math.round(3 + Math.pow(Math.random(), 1.35) * 240)
+    if (Math.random() < 0.035) {
+      durationMinutes = Math.round(380 + Math.random() * 3600)
+    }
+    durationMinutes = Math.max(1, durationMinutes)
+    const severity = 1 + Math.floor(Math.random() * 10)
+    const noise = (mag: number) => (Math.random() - 0.5) * mag
+    const dataLossGb = Math.max(
+      0.02,
+      12 + severity * 5.5 + durationMinutes * 0.035 + noise(22) + Math.pow(Math.random(), 1.4) * 35,
+    )
+    const costKUsd = Math.max(
+      0.15,
+      6 + severity * 4.2 + dataLossGb * 0.42 + durationMinutes * 0.055 + noise(18) + Math.random() * 28,
+    )
+    const c = COUNTRIES[Math.floor(Math.random() * COUNTRIES.length)]!
+    events.push({
+      id: `evt-${i}`,
+      attackType: types[Math.floor(Math.random() * types.length)]!,
+        
+  // FilteredChartsPanel content removed; charts are rendered in `App()` directly.
+}
+
+function defaultDateRange(): { start: string; end: string } {
+  const end = new Date()
+  const start = new Date(end)
+  start.setDate(start.getDate() - 30)
+  const toIso = (d: Date) => d.toISOString().slice(0, 10)
+  return { start: toIso(start), end: toIso(end) }
+}
+
+const nav = [
+  {
+    id: 'dashboard',
+    label: 'Dashboard',
+    icon: (
+      <svg className="size-5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" aria-hidden>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM13.5 15.75A2.25 2.25 0 0 1 15.75 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H15.75A2.25 2.25 0 0 1 13.5 18v-2.25ZM13.5 6A2.25 2.25 0 0 1 15.75 3.75h2.25A2.25 2.25 0 0 1 20.25 6v2.25a2.25 2.25 0 0 1-2.25 2.25H15.75A2.25 2.25 0 0 1 13.5 8.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25v-2.25Z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'analytics',
+    label: 'Analytics',
+    icon: (
+      <svg className="size-5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" aria-hidden>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 0 1 3 19.875v-6.75ZM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 0 1-1.125-1.125V8.625ZM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 0 1-1.125-1.125V4.125Z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'reports',
+    label: 'Reports',
+    icon: (
+      <svg className="size-5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" aria-hidden>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
+      </svg>
+    ),
+  },
+] as const
+
+function ThemeToggle({ isDark, onToggle }: { isDark: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="flex size-10 items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-600 shadow-sm transition hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+      aria-label={isDark ? 'Switch to light theme' : 'Switch to dark theme'}
+    >
+      {isDark ? (
+        <svg className="size-5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" aria-hidden>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v2.25m6.364.386-1.591 1.591M21 12h-2.25m-.386 6.364-1.591-1.591M12 18.75V21m-4.773-4.227-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0Z" />
+        </svg>
+      ) : (
+        <svg className="size-5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" aria-hidden>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M21.752 15.002A9.72 9.72 0 0 1 18 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 0 0 3 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 0 0 9.002-5.998Z" />
+        </svg>
+      )}
+    </button>
+  )
+}
+
+type KpiTone = 'cyan' | 'amber' | 'rose' | 'violet'
+
+const kpiToneClass: Record<
+  KpiTone,
+  { box: string; icon: string }
+> = {
+  cyan: {
+    box: 'bg-cyan-500/10 ring-cyan-500/20 dark:bg-cyan-500/15 dark:ring-cyan-400/20',
+    icon: 'text-cyan-600 dark:text-cyan-400',
+  },
+  amber: {
+    box: 'bg-amber-500/10 ring-amber-500/20 dark:bg-amber-500/15 dark:ring-amber-400/20',
+    icon: 'text-amber-600 dark:text-amber-400',
+  },
+  rose: {
+    box: 'bg-rose-500/10 ring-rose-500/20 dark:bg-rose-500/15 dark:ring-rose-400/20',
+    icon: 'text-rose-600 dark:text-rose-400',
+  },
+  violet: {
+    box: 'bg-violet-500/10 ring-violet-500/20 dark:bg-violet-500/15 dark:ring-violet-400/20',
+    icon: 'text-violet-600 dark:text-violet-400',
+  },
+}
+
+function KpiCard({
+  title,
+  value,
+  subtext,
+  trend,
+  trendSentiment = 'neutral',
+  tone,
+  icon,
+}: {
+  title: string
+  value: string
+  subtext: string
+  trend?: string
+  trendSentiment?: 'positive' | 'negative' | 'neutral'
+  tone: KpiTone
+  icon: ReactNode
+}) {
+  const t = kpiToneClass[tone]
+  const trendCls =
+    trendSentiment === 'neutral'
+      ? 'text-zinc-500 dark:text-zinc-400'
+      : trendSentiment === 'positive'
+        ? 'text-emerald-600 dark:text-emerald-400'
+        : 'text-rose-600 dark:text-rose-400'
+
+  return (
+    <div className="group relative overflow-hidden rounded-2xl border border-zinc-200/90 bg-white p-4 shadow-sm ring-1 ring-black/[0.02] transition hover:border-zinc-300/90 hover:shadow-md dark:border-zinc-800 dark:bg-zinc-900/70 dark:ring-white/[0.04] dark:hover:border-zinc-700 sm:p-5">
+      <div
+        className={`pointer-events-none absolute -right-6 -top-6 size-28 rounded-full opacity-[0.22] blur-2xl transition-opacity group-hover:opacity-40 dark:opacity-[0.14] dark:group-hover:opacity-25 ${
+          tone === 'cyan'
+            ? 'bg-cyan-400'
+            : tone === 'amber'
+              ? 'bg-amber-400'
+              : tone === 'rose'
+                ? 'bg-rose-400'
+                : 'bg-violet-400'
+        }`}
+        aria-hidden
+      />
+
+      <div className="relative flex gap-4">
+        <div
+          className={`flex size-11 shrink-0 items-center justify-center rounded-xl ring-1 sm:size-12 ${t.box}`}
+        >
+          <span className={t.icon}>{icon}</span>
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-zinc-500 dark:text-zinc-400">
+            {title}
+          </p>
+          <p className="mt-1.5 text-2xl font-semibold tracking-tight text-zinc-900 tabular-nums dark:text-zinc-50 sm:text-3xl sm:leading-none">
+            {value}
+          </p>
+          <p className="mt-2 text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">{subtext}</p>
+          {trend ? (
+            <p className={`mt-1 text-xs font-medium ${trendCls}`}>{trend}</p>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+type AttackBarTooltipProps = {
+  active?: boolean
+  payload?: ReadonlyArray<{ value?: unknown; payload?: Record<string, unknown> }>
+  label?: unknown
+  isDark: boolean
+}
+
+function AttackBarTooltip({ active, payload, label, isDark }: AttackBarTooltipProps) {
+  if (!active || !payload?.length) return null
+  const row = payload[0]
+  const p = row?.payload as { attack_type?: string; count?: number } | undefined
+  const name = p?.attack_type ?? String(label ?? '')
+  const raw = row?.value ?? p?.count ?? 0
+  const count = typeof raw === 'number' ? raw : Number(raw)
+  return (
+    <div
+      className={`rounded-lg border px-3 py-2 text-sm shadow-lg backdrop-blur-sm ${
+        isDark
+          ? 'border-zinc-600 bg-zinc-900/95 text-zinc-100'
+          : 'border-zinc-200 bg-white/95 text-zinc-900'
+      }`}
+    >
+      <p className="font-semibold">{name}</p>
+      <p className={`mt-0.5 text-xs tabular-nums ${isDark ? 'text-zinc-400' : 'text-zinc-500'}`}>
+        {formatCompact(Number.isFinite(count) ? count : 0)} attacks
+      </p>
+    </div>
+  )
+}
+
+type TimeSeriesTooltipProps = {
+  active?: boolean
+  payload?: unknown
+  label?: unknown
+  isDark: boolean
+  valueLabel: string
+}
+
+function PieDistributionTooltip({
+  active,
+  payload,
+  isDark,
+}: {
+  active?: boolean
+  payload?: unknown
+  isDark: boolean
+}) {
+  if (!active || !Array.isArray(payload) || !payload.length) return null
+  const pl = payload[0] as {
+    name?: string
+    value?: number
+    payload?: { attack_type?: string; count?: number; percent?: number }
+  }
+  const row = pl.payload
+  const name = row?.attack_type ?? pl.name ?? '—'
+  const count = row?.count ?? pl.value ?? 0
+  const pct = row?.percent
+  return (
+    <div
+      className={`rounded-lg border px-3 py-2 text-sm shadow-lg backdrop-blur-sm ${
+        isDark
+          ? 'border-zinc-600 bg-zinc-900/95 text-zinc-100'
+          : 'border-zinc-200 bg-white/95 text-zinc-900'
+      }`}
+    >
+      <p className="font-semibold">{name}</p>
+      <p className={`mt-1 text-xs tabular-nums ${isDark ? 'text-zinc-400' : 'text-zinc-500'}`}>
+        {formatCompact(Number.isFinite(Number(count)) ? Number(count) : 0)} attacks
+        {typeof pct === 'number' ? ` · ${pct}% of filtered set` : null}
+      </p>
+    </div>
+  )
+}
+
+function TimeSeriesTooltip({ active, payload, label, isDark, valueLabel }: TimeSeriesTooltipProps) {
+  if (!active || !Array.isArray(payload) || !payload.length) return null
+  const row = payload[0] as { value?: unknown; payload?: Record<string, unknown> } | undefined
+  if (!row) return null
+  const p = row.payload as { date?: string } | undefined
+  const dateStr = p?.date ?? String(label ?? '')
+  const raw = row?.value
+  const n = typeof raw === 'number' ? raw : Number(raw)
+  return (
+    <div
+      className={`rounded-lg border px-3 py-2 text-sm shadow-lg backdrop-blur-sm ${
+        isDark
+          ? 'border-zinc-600 bg-zinc-900/95 text-zinc-100'
+          : 'border-zinc-200 bg-white/95 text-zinc-900'
+      }`}
+    >
+      <p className={`text-xs font-medium ${isDark ? 'text-zinc-400' : 'text-zinc-500'}`}>{dateStr}</p>
+      <p className="mt-1 font-semibold tabular-nums">
+        {formatCompact(Number.isFinite(n) ? n : 0)} <span className="font-normal opacity-80">{valueLabel}</span>
+      </p>
+    </div>
+  )
+}
+
+// DashboardKpiStrip: removed (unused) to satisfy compiler option `noUnusedLocals`.
+// If you need this block later, restore from VCS history or reintroduce as a used component.
+
+
+// FilteredChartsPanel: removed (unused) to satisfy compiler option `noUnusedLocals`.
+// Restore from VCS if you need the panel logic again.
+        
+
+
+  // Temporary placeholders to keep this section syntactically valid.
+  // Real `filteredEvents` and `isDark` are available inside `App()`; these
+  // top-level placeholders are harmless and will be shadowed by inner scope.
+  const filteredEvents: MockEvent[] = []
+  const isDark = false
+  
+
+  
+
+  // FilteredChartsPanel content removed; charts are rendered in `App()` directly.
+
+function App() {
+  const [isDark, setIsDark] = useState(true)
+  const [activeNav, setActiveNav] = useState<string>('dashboard')
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+
+  const [attackType, setAttackType] = useState<AttackTypeOption>('all')
+  const [dateStart, setDateStart] = useState(() => defaultDateRange().start)
+  const [dateEnd, setDateEnd] = useState(() => defaultDateRange().end)
+  const [severityMin, setSeverityMin] = useState(1)
+  const [severityMax, setSeverityMax] = useState(10)
+  const [allEvents, setAllEvents] = useState<MockEvent[]>([])
+  const [isLoading, setIsLoading] = useState(true)
+
+  useEffect(() => {
+    let mounted = true
+    // simulate async load of events (replace with real fetch as needed)
+    setTimeout(() => {
+      if (!mounted) return
+      setAllEvents(generateMockEvents())
+      setIsLoading(false)
+    }, 300)
+    return () => {
+      mounted = false
+    }
+  }, [])
+
+  useEffect(() => {
+    try {
+      const root = document.documentElement
+      if (isDark) root.classList.add('dark')
+      else root.classList.remove('dark')
+    } catch (e) {
+      // ignore server environments
+    }
+  }, [isDark])
+
+  const filteredEvents = useMemo(() => {
+    const t0 = parseISODateLocal(dateStart)
+    const t1 = endOfDayLocal(dateEnd)
+    if (t1 < t0) return []
+
+    return allEvents.filter((e) => {
+      if (e.at < t0 || e.at > t1) return false
+      if (attackType !== 'all' && e.attackType !== attackType) return false
+      if (e.severity < severityMin || e.severity > severityMax) return false
+      return true
+    })
+  }, [allEvents, attackType, dateEnd, dateStart, severityMax, severityMin])
+
+  const attacksByCountry = useMemo(() => {
+    const m = new Map<string, { iso3: string; country: string; attacks: number }>()
+    for (const e of filteredEvents) {
+      const iso = e.countryIso3 || 'UNK'
+      const name = e.country || iso
+      const cur = m.get(iso)
+      if (cur) cur.attacks += 1
+      else m.set(iso, { iso3: iso, country: name, attacks: 1 })
+    }
+    return Array.from(m.values()).sort((a, b) => b.attacks - a.attacks)
+  }, [filteredEvents])
+
+  const anomaliesSet = useMemo(() => {
+    if (filteredEvents.length === 0) return new Set<string>()
+    const sev = filteredEvents.map((e) => e.severity).sort((a, b) => a - b)
+    const dur = filteredEvents.map((e) => e.durationMinutes).sort((a, b) => a - b)
+    const sevStats = boxFenceStats(sev)
+    const durStats = boxFenceStats(dur)
+    const s = new Set<string>()
+    for (const e of filteredEvents) {
+      const isSev = sevStats ? isFenceOutlier(e.severity, sevStats) : false
+      const isDur = durStats ? isFenceOutlier(e.durationMinutes, durStats) : false
+      if (isSev || isDur) s.add(e.id)
+    }
+    return s
+  }, [filteredEvents])
+  const [liveSortBy, setLiveSortBy] = useState<'time' | 'severity' | 'dataLoss'>('time')
+
+  const queueRows = useMemo(() => {
+    const base = [...filteredEvents]
+    if (liveSortBy === 'severity') base.sort((a, b) => b.severity - a.severity || b.at - a.at)
+    else if (liveSortBy === 'dataLoss') base.sort((a, b) => b.dataLossGb - a.dataLossGb || b.at - a.at)
+    else base.sort((a, b) => b.at - a.at)
+    return base.slice(0, 6).map((e) => {
+      const sev = e.severity >= 8 ? 'Critical' : e.severity >= 5 ? 'High' : e.severity >= 3 ? 'Medium' : 'Low'
+      const mins = Math.max(0, Math.floor((Date.now() - e.at) / 60000))
+      const time = mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h`
+      return { key: e.id, t: `${e.attackType} · ${sev}`, time, isAnomaly: anomaliesSet.has(e.id) }
+    })
+  }, [filteredEvents, liveSortBy, anomaliesSet])
+ 
+
+  const threatBars = useMemo(() => {
+    const counts = new Array(12).fill(0)
+    for (const e of filteredEvents) {
+      const h = new Date(e.at).getHours()
+      const bin = Math.min(11, Math.floor(h / 2))
+      counts[bin]++
+    }
+    const max = Math.max(1, ...counts)
+    return counts.map((c) => Math.max(8, Math.round((c / max) * 100)))
+  }, [filteredEvents])
+
+  const threatLabels = ['0h', '2h', '4h', '6h', '8h', '10h', '12h', '14h', '16h', '18h', '20h', '22h']
+
+  const attacksByTypeChart = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const t of ATTACK_TYPE_LABELS) counts.set(t, 0)
+    for (const e of filteredEvents) {
+      counts.set(e.attackType, (counts.get(e.attackType) || 0) + 1)
+    }
+    return ATTACK_TYPE_LABELS.map((attack_type) => ({
+      attack_type,
+      count: counts.get(attack_type) ?? 0,
+    }))
+  }, [filteredEvents])
+
+  const pieChartData = useMemo(() => {
+    const rows = attacksByTypeChart.filter((d) => d.count > 0)
+    const total = rows.reduce((s, d) => s + d.count, 0) || 1
+    return rows.map((d) => ({
+      ...d,
+      percent: Math.round((d.count / total) * 1000) / 10,
+    }))
+  }, [attacksByTypeChart])
+
+  const attacksOverTime = useMemo(() => {
+    const t0 = parseISODateLocal(dateStart)
+    const t1 = parseISODateLocal(dateEnd)
+    if (t1 < t0) return []
+
+    const byDay = new Map<string, number>()
+    for (let x = t0; x <= t1; x += 86400000) {
+      byDay.set(formatLocalISODate(new Date(x)), 0)
+    }
+    for (const e of filteredEvents) {
+      const key = formatLocalISODate(new Date(e.at))
+      if (byDay.has(key)) {
+        byDay.set(key, (byDay.get(key) || 0) + 1)
+      }
+    }
+
+    return Array.from(byDay.keys())
+      .sort()
+      .map((date) => ({ date, attacks: byDay.get(date) ?? 0 }))
+  }, [dateEnd, dateStart, filteredEvents])
+
+  const attacksCumulative = useMemo(() => {
+    let sum = 0
+    return attacksOverTime.map((row) => {
+      sum += row.attacks
+      return { date: row.date, attacks: row.attacks, cumulative: sum }
+    })
+  }, [attacksOverTime])
+
+  const chartAxisTick = isDark ? '#a1a1aa' : '#52525b'
+  const chartGrid = isDark ? '#3f3f46' : '#e4e4e7'
+  const chartCursor = isDark ? 'rgba(39, 39, 42, 0.45)' : 'rgba(24, 24, 27, 0.06)'
+
+  const severityHistogram = useMemo(() => {
+    const counts = new Array(10).fill(0)
+    for (const e of filteredEvents) {
+      const s = Math.min(10, Math.max(1, Math.round(Number(e.severity))))
+      counts[s - 1]++
+    }
+    return counts as number[]
+  }, [filteredEvents])
+
+  const severityHistogramChartData = useMemo((): ChartData<'bar'> => {
+    const edge = isDark ? '#3f3f46' : '#e4e4e7'
+    return {
+      labels: [...SEVERITY_BIN_LABELS],
+      datasets: [
+        {
+          label: 'Attacks',
+          data: severityHistogram,
+          backgroundColor: SEVERITY_HISTOGRAM_FILLS,
+          borderColor: edge,
+          borderWidth: 1,
+          borderRadius: 6,
+          borderSkipped: false,
+          barPercentage: 1,
+          categoryPercentage: 0.9,
+        },
+      ],
+    }
+  }, [isDark, severityHistogram])
+
+  const severityHistogramOptions = useMemo((): ChartOptions<'bar'> => {
+    const tick = isDark ? '#a1a1aa' : '#52525b'
+    const grid = isDark ? 'rgba(63, 63, 70, 0.55)' : 'rgba(228, 228, 231, 0.9)'
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: {
+        duration: 850,
+        easing: 'easeOutQuart',
+      },
+      interaction: {
+        mode: 'index',
+        intersect: false,
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: isDark ? 'rgba(24, 24, 27, 0.94)' : 'rgba(255, 255, 255, 0.97)',
+          titleColor: isDark ? '#f4f4f5' : '#18181b',
+          bodyColor: isDark ? '#a1a1aa' : '#52525b',
+          borderColor: isDark ? '#3f3f46' : '#e4e4e7',
+          borderWidth: 1,
+          padding: 10,
+          cornerRadius: 8,
+          displayColors: false,
+          callbacks: {
+            title: (items) => {
+              const label = items[0]?.label
+              return `Severity score ${label ?? ''}`
+            },
+            label: (item) => {
+              const raw = item.raw
+              const v = typeof raw === 'number' ? raw : Number(raw)
+              return `${formatCompact(Number.isFinite(v) ? v : 0)} attacks`
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          offset: true,
+          title: {
+            display: true,
+            text: 'Severity (1–10)',
+            color: tick,
+            font: { size: 11, weight: 'bold' },
+          },
+          ticks: {
+            color: tick,
+            font: { size: 11 },
+          },
+          grid: { display: false },
+        },
+        y: {
+          beginAtZero: true,
+          title: {
+            display: true,
+            text: 'Count',
+            color: tick,
+            font: { size: 11, weight: 'bold' },
+          },
+          ticks: {
+            color: tick,
+            precision: 0,
+            maxTicksLimit: 9,
+          },
+          grid: {
+            color: grid,
+            drawTicks: false,
+          },
+          border: { display: false },
+        },
+      },
+    }
+  }, [isDark])
+
+  const boxPlotFigure = useMemo(() => {
+    const n = filteredEvents.length
+    if (n === 0) {
+      return { data: [] as Data[], layout: {} as Partial<Layout> }
+    }
+
+    const sev = filteredEvents.map((e) => e.severity)
+    const dur = filteredEvents.map((e) => e.durationMinutes)
+    const sevStats = boxFenceStats([...sev].sort((a, b) => a - b))
+    const durStats = boxFenceStats([...dur].sort((a, b) => a - b))
+    if (!sevStats || !durStats) {
+      return { data: [] as Data[], layout: {} as Partial<Layout> }
+    }
+
+    const sevCustom = sev.map((v) => boxPointHoverHtml(v, sevStats, 'severity'))
+    const durCustom = dur.map((v) => boxPointHoverHtml(v, durStats, 'duration'))
+    const sevOut = sev.map((v) => isFenceOutlier(v, sevStats))
+    const durOut = dur.map((v) => isFenceOutlier(v, durStats))
+
+    const paper = 'rgba(0,0,0,0)'
+    const plot = isDark ? '#18181b' : '#fafafa'
+    const fg = isDark ? '#e4e4e7' : '#3f3f46'
+    const grid = isDark ? '#27272a' : '#e4e4e7'
+    const muted = isDark ? 'rgba(148,163,184,0.5)' : 'rgba(100,116,139,0.45)'
+    const hot = '#fb7185'
+
+    const traceSeverity: Data = {
+      type: 'box',
+      name: 'Severity',
+      y: sev,
+      xaxis: 'x',
+      yaxis: 'y',
+      boxpoints: 'all',
+      jitter: 0.35,
+      pointpos: -1.75,
+      customdata: sevCustom,
+      hovertemplate: '<b>Severity %{y}</b><br>%{customdata}<extra></extra>',
+      marker: {
+        color: sev.map((_, i) => (sevOut[i] ? hot : muted)),
+        size: sev.map((_, i) => (sevOut[i] ? 10 : 4)),
+        line: { width: 0 },
+      },
+      fillcolor: isDark ? 'rgba(6,182,212,0.3)' : 'rgba(6,182,212,0.22)',
+      line: { color: '#06b6d4', width: 2 },
+    }
+
+    const traceDuration: Data = {
+      type: 'box',
+      name: 'Duration',
+      y: dur,
+      xaxis: 'x2',
+      yaxis: 'y2',
+      boxpoints: 'all',
+      jitter: 0.35,
+      pointpos: -1.75,
+      customdata: durCustom,
+      hovertemplate: '<b>Duration %{y:.0f} min</b><br>%{customdata}<extra></extra>',
+      marker: {
+        color: dur.map((_, i) => (durOut[i] ? hot : muted)),
+        size: dur.map((_, i) => (durOut[i] ? 10 : 4)),
+        line: { width: 0 },
+      },
+      fillcolor: isDark ? 'rgba(99,102,241,0.3)' : 'rgba(99,102,241,0.22)',
+      line: { color: '#6366f1', width: 2 },
+    }
+
+    const layout: Partial<Layout> = {
+      autosize: true,
+      paper_bgcolor: paper,
+      plot_bgcolor: plot,
+      font: { family: 'Plus Jakarta Sans, system-ui, sans-serif', color: fg, size: 12 },
+      margin: { l: 52, r: 56, t: 20, b: 36 },
+      showlegend: false,
+      dragmode: 'zoom',
+      hovermode: 'closest',
+      xaxis: {
+        domain: [0, 0.46],
+        zeroline: false,
+        showticklabels: false,
+        title: { text: 'Severity', standoff: 10 },
+      },
+      yaxis: {
+        domain: [0, 1],
+        title: { text: 'Score (1–10)' },
+        zeroline: false,
+        gridcolor: grid,
+        rangemode: 'tozero',
+      },
+      xaxis2: {
+        domain: [0.54, 1],
+        zeroline: false,
+        showticklabels: false,
+        title: { text: 'Duration', standoff: 10 },
+        anchor: 'y2',
+      },
+      yaxis2: {
+        domain: [0, 1],
+        title: { text: 'Minutes' },
+        anchor: 'x2',
+        zeroline: false,
+        gridcolor: grid,
+        rangemode: 'tozero',
+        side: 'right',
+      },
+    }
+
+    return { data: [traceSeverity, traceDuration], layout }
+  }, [filteredEvents, isDark])
+
+  const boxPlotConfig = useMemo(
+    (): Partial<Config> => ({
+      responsive: true,
+      displayModeBar: true,
+      displaylogo: false,
+      scrollZoom: true,
+      doubleClick: 'reset',
+      modeBarButtonsToRemove: ['lasso2d', 'select2d'],
+    }),
+    [],
+  )
+
+  const correlationHeatmapFigure = useMemo(() => {
+    const n = filteredEvents.length
+    const labels = [...CORRELATION_METRIC_LABELS]
+
+    if (n < 2) {
+      return { data: [] as Data[], layout: {} as Partial<Layout> }
+    }
+
+    const cols = [
+      filteredEvents.map((e) => e.severity),
+      filteredEvents.map((e) => e.durationMinutes),
+      filteredEvents.map((e) => e.dataLossGb),
+      filteredEvents.map((e) => e.costKUsd),
+    ]
+    const z = correlationMatrix(cols)
+
+    const paper = 'rgba(0,0,0,0)'
+    const plot = isDark ? '#18181b' : '#fafafa'
+    const fg = isDark ? '#e4e4e7' : '#3f3f46'
+    const grid = isDark ? '#3f3f46' : '#e4e4e7'
+    const mid = isDark ? '#27272a' : '#f1f5f9'
+
+    const trace: Data = {
+      type: 'heatmap',
+      x: labels,
+      y: labels,
+      z,
+      zmin: -1,
+      zmax: 1,
+      colorscale: [
+        [0, '#1d4ed8'],
+        [0.25, '#60a5fa'],
+        [0.5, mid],
+        [0.75, '#fb923c'],
+        [1, '#dc2626'],
+      ],
+      colorbar: {
+        title: {
+          text: 'Pearson r',
+          side: 'right',
+          font: { size: 11, color: fg },
+        },
+        tickmode: 'linear',
+        tick0: -1,
+        dtick: 0.25,
+        tickfont: { size: 10, color: fg },
+        outlinecolor: grid,
+        outlinewidth: 1,
+        len: 0.92,
+        thickness: 16,
+        x: 1.02,
+      },
+      texttemplate: '%{z:.2f}',
+      textfont: { size: 11, color: isDark ? '#fafafa' : '#0f172a' },
+      hovertemplate:
+        '<b>%{y}</b> × <b>%{x}</b><br>r = %{z:.3f}<br><sub>Linear correlation on filtered rows (n=' +
+        n +
+        ')</sub><extra></extra>',
+      xgap: 3,
+      ygap: 3,
+      showscale: true,
+    }
+
+    const layout: Partial<Layout> = {
+      autosize: true,
+      paper_bgcolor: paper,
+      plot_bgcolor: plot,
+      font: { family: 'Plus Jakarta Sans, system-ui, sans-serif', color: fg, size: 12 },
+      margin: { l: 128, r: 72, t: 48, b: 112 },
+      title: {
+        text: 'Metric correlation matrix',
+        subtitle: {
+          text: 'Pairwise Pearson r · −1 (inverse) → 0 (none) → +1 (same direction)',
+          font: { size: 11, color: isDark ? '#a1a1aa' : '#64748b' },
+        },
+        font: { size: 14, color: fg },
+        x: 0,
+        xanchor: 'left',
+        y: 0.98,
+        yanchor: 'top',
+      },
+      xaxis: {
+        tickangle: -28,
+        tickfont: { size: 10, color: fg },
+        side: 'bottom',
+        showgrid: false,
+        zeroline: false,
+      },
+      yaxis: {
+        autorange: 'reversed',
+        tickfont: { size: 10, color: fg },
+        showgrid: false,
+        zeroline: false,
+      },
+      annotations: [
+        {
+          text: 'Row vs column variable',
+          xref: 'paper',
+          yref: 'paper',
+          x: 0,
+          y: -0.08,
+          xanchor: 'left',
+          yanchor: 'top',
+          showarrow: false,
+          font: { size: 10, color: isDark ? '#a1a1aa' : '#64748b' },
+        },
+      ],
+    }
+
+    return { data: [trace], layout }
+  }, [filteredEvents, isDark])
+
+  const exposureRows = useMemo(() => {
+    const ing = filteredEvents.filter((e) => e.attackType === 'DDoS' || e.attackType === 'Malware').length
+    const cve = filteredEvents.filter((e) => e.attackType === 'Ransomware').length
+    const iam = filteredEvents.filter((e) => e.attackType === 'Credential stuffing' || e.attackType === 'Phishing').length
+    const total = ing + cve + iam || 1
+    return [
+      { label: 'Public ingress', pct: Math.round((ing / total) * 100), count: ing },
+      { label: 'Unpatched CVEs', pct: Math.round((cve / total) * 100), count: cve },
+      { label: 'Over-privileged IAM', pct: Math.round((iam / total) * 100), count: iam },
+    ]
+  }, [filteredEvents])
+
+  
+
+  const kpiStats = useMemo(() => {
+    const n = filteredEvents.length
+    const avg = n ? filteredEvents.reduce((s, e) => s + e.severity, 0) / n : 0
+    const tb = n ? filteredEvents.reduce((s, e) => s + e.severity * 0.031 + 0.004, 0) : 0
+    const freq = new Map<string, number>()
+    for (const e of filteredEvents) {
+      freq.set(e.attackType, (freq.get(e.attackType) || 0) + 1)
+    }
+    let topType = '—'
+    let topN = 0
+    for (const [k, v] of freq) {
+      if (v > topN) {
+        topN = v
+        topType = k
+      }
+    }
+    const topPct = n ? Math.round((topN / n) * 100) : 0
+    const corpusPct = allEvents.length ? Math.round((n / allEvents.length) * 100) : 0
+    return {
+      total: n,
+      avgLabel: `${avg.toFixed(1)} / 10`,
+      dataLoss: `${tb >= 1000 ? (tb / 1000).toFixed(1) + ' PB' : tb.toFixed(1) + ' TB'}`,
+      topType,
+      topPct,
+      corpusPct,
+    }
+  }, [allEvents.length, filteredEvents])
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', isDark)
+  }, [isDark])
+
+  return (
+    <div className="min-h-dvh bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+      {/* Mobile overlay */}
+      {sidebarOpen ? (
+        <button
+          type="button"
+          className="fixed inset-0 z-40 bg-zinc-950/60 backdrop-blur-sm lg:hidden"
+          aria-label="Close menu"
+          onClick={() => setSidebarOpen(false)}
+        />
+      ) : null}
+
+      <aside
+        className={`fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-zinc-200 bg-white transition-transform dark:border-zinc-800 dark:bg-zinc-900 lg:translate-x-0 ${
+          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+        }`}
+      >
+        <div className="flex h-16 items-center gap-2 border-b border-zinc-200 px-5 dark:border-zinc-800">
+          <div className="flex size-9 items-center justify-center rounded-lg bg-gradient-to-br from-cyan-500 to-teal-600 text-white shadow-lg shadow-cyan-500/25">
+            <svg className="size-5" fill="currentColor" viewBox="0 0 24 24" aria-hidden>
+              <path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z" />
+            </svg>
+          </div>
+          <div>
+            <p className="text-sm font-semibold tracking-tight">Sentinel</p>
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">Security Ops</p>
+          </div>
+        </div>
+
+        <nav className="flex flex-1 flex-col gap-1 p-3" aria-label="Main">
+          {nav.map((item) => {
+            const active = activeNav === item.id
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => {
+                  setActiveNav(item.id)
+                  setSidebarOpen(false)
+                }}
+                className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm font-medium transition ${
+                  active
+                    ? 'bg-cyan-500/10 text-cyan-700 dark:bg-cyan-500/15 dark:text-cyan-300'
+                    : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+                }`}
+              >
+                <span className={active ? 'text-cyan-600 dark:text-cyan-400' : ''}>{item.icon}</span>
+                {item.label}
+              </button>
+            )
+          })}
+        </nav>
+
+        <div className="border-t border-zinc-200 p-4 dark:border-zinc-800">
+          <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-800/50">
+            <p className="text-xs font-medium text-zinc-700 dark:text-zinc-200">SOC shift</p>
+            <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">Tier-2 on call · ETA 4m</p>
+          </div>
+        </div>
+      </aside>
+
+      <div className="lg:pl-64">
+        <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-4 border-b border-zinc-200 bg-zinc-50/80 px-4 backdrop-blur-md dark:border-zinc-800 dark:bg-zinc-950/80 sm:px-6 lg:px-8"> (truncated for brevity)
